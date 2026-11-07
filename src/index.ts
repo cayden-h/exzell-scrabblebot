@@ -75,6 +75,7 @@ const subscribedMatches = new Set<bigint>();
 const bidSent = new Map<bigint, number>(); // auctionId -> amount
 const pendingWords = new Map<bigint, string[]>(); // matchId -> words sent, not yet confirmed
 const registered = new Set<bigint>();
+const registering = new Set<bigint>();
 let lastLobbyJoinAt = 0;
 let seatTimer: ReturnType<typeof setTimeout> | null = null;
 
@@ -100,6 +101,21 @@ function readToken(): string | undefined {
   } catch {
     return undefined;
   }
+}
+
+// Recent reducer round trips (ms), to flush words early when the server lags.
+const rtts: number[] = [];
+function timed<T>(p: Promise<T>): Promise<T> {
+  const t = Date.now();
+  return p.finally(() => {
+    rtts.push(Date.now() - t);
+    if (rtts.length > 50) rtts.shift();
+  });
+}
+function rttP90(): number {
+  if (rtts.length < 5) return 300;
+  const sorted = [...rtts].sort((a, b) => a - b);
+  return sorted[Math.floor(sorted.length * 0.9)];
 }
 
 function fail(what: string) {
@@ -165,7 +181,8 @@ function subscribeMatch(matchId: bigint) {
   conn
     .subscriptionBuilder()
     .onApplied(() => {
-      log("match_subscribed", { matchId });
+      const tm = [...conn.db.tournamentMatch.iter()].find((x) => x.matchId === matchId);
+      log("match_subscribed", { matchId, tournament: tm ? { id: tm.tournamentId, round: tm.round, phase: tm.phase.tag } : null, auctionType: conn.db.matchState.id.find(matchId)?.auctionType.tag, rttP90: rttP90() });
       for (const a of conn.db.auction.iter()) if (a.matchId === matchId && a.status.tag === "Open") onAuction(a);
       tryPlay(matchId);
     })
@@ -210,7 +227,7 @@ function onAuction(a: { id: bigint; matchId: bigint; letter: string; status: { t
   const left = auctionsLeft(a.matchId);
   const t = Date.now();
   const ctx = matchContext(a.matchId);
-  const amount = decideBid(
+  let amount = decideBid(
     DICT,
     {
       letter: a.letter,
@@ -223,6 +240,9 @@ function onAuction(a: { id: bigint; matchId: bigint; letter: string; status: { t
     },
     PARAMS,
   );
+  // Coins are worthless once the second-to-last auction closes, so spend them
+  // all on it: we may still play the tile in the last window, and a rival can't.
+  if (left === 2 && Number(p.balance) > amount) amount = Number(p.balance);
   bidSent.set(a.id, amount);
   log("bid", {
     matchId: a.matchId,
@@ -236,9 +256,25 @@ function onAuction(a: { id: bigint; matchId: bigint; letter: string; status: { t
     bagLeft: ctx.bagLeft,
     ms: Date.now() - t,
   });
-  if (amount > 0) conn.reducers.submitBid({ auctionId: a.id, amount: BigInt(amount) }).catch(fail(`bid ${a.id}`));
+  if (amount > 0) timed(conn.reducers.submitBid({ auctionId: a.id, amount: BigInt(amount) })).catch(fail(`bid ${a.id}`));
   // A bid may have been blocked by low cash; check whether to cash a word.
   tryPlay(a.matchId);
+}
+
+// Auctions left as the strategy should see them. When the server is slow, a
+// flush at the normal point could land after the match ends, so report the
+// flush point early once the time left drops under ~2 round trips + margin.
+function effectiveLeft(matchId: bigint): number {
+  const left = auctionsLeft(matchId);
+  const m = conn.db.matchState.id.find(matchId);
+  if (!m || left <= PARAMS.flushAt) return left;
+  const dur = Number(m.auctionDurationMs);
+  const msLeft = (left - 1) * dur + dur / 2;
+  if (msLeft < 2 * rttP90() + 300) {
+    log("early_flush", { matchId, left, p90: rttP90() });
+    return PARAMS.flushAt;
+  }
+  return left;
 }
 
 function tryPlay(matchId: bigint) {
@@ -251,7 +287,7 @@ function tryPlay(matchId: bigint) {
   const t = Date.now();
   const words = chooseWords(
     DICT,
-    { rack, balance: Number(p.balance), auctionsLeft: auctionsLeft(matchId), ...matchContext(matchId) },
+    { rack, balance: Number(p.balance), auctionsLeft: effectiveLeft(matchId), ...matchContext(matchId) },
     PARAMS,
   );
   if (words.length === 0) return;
@@ -260,8 +296,7 @@ function tryPlay(matchId: bigint) {
   log("play", { matchId, words, rack: rackToString(rack), balance: Number(p.balance), ms: Date.now() - t });
   for (const word of words) {
     pend.push(word);
-    conn.reducers
-      .submitWord({ matchId, word })
+    timed(conn.reducers.submitWord({ matchId, word }))
       .catch(fail(`word ${word}`))
       .finally(() => {
         const i = pend.indexOf(word);
@@ -283,15 +318,22 @@ function joinLobby(reason: string) {
 function maybeRegister() {
   if (!AUTO_REGISTER || myBotId === null) return;
   for (const t of conn.db.tournament.iter()) {
-    if (t.status.tag !== "Registration" || registered.has(t.id)) continue;
-    const already = [...conn.db.tournamentEntry.iter()].some((e) => e.tournamentId === t.id && e.botId === myBotId);
-    registered.add(t.id);
-    if (already) {
-      log("tournament_already_registered", { tournamentId: t.id });
+    if (t.status.tag !== "Registration") continue;
+    const entered = [...conn.db.tournamentEntry.iter()].some((e) => e.tournamentId === t.id && e.botId === myBotId);
+    if (entered) {
+      if (!registered.has(t.id)) log("tournament_already_registered", { tournamentId: t.id });
+      registered.add(t.id);
       continue;
     }
+    // `registering` holds in-flight calls; a failure clears it so the next tick retries.
+    if (registering.has(t.id)) continue;
+    registering.add(t.id);
     log("tournament_register", { tournamentId: t.id, auctionType: t.auctionType.tag });
-    conn.reducers.registerForTournament({ tournamentId: t.id }).catch(fail(`register ${t.id}`));
+    conn.reducers
+      .registerForTournament({ tournamentId: t.id })
+      .then(() => log("tournament_register_ok", { tournamentId: t.id }))
+      .catch(fail(`register ${t.id}`))
+      .finally(() => registering.delete(t.id));
   }
 }
 
@@ -327,6 +369,7 @@ function onConnect(c: DbConnection, identity: Identity, token: string) {
       "SELECT * FROM bot",
       "SELECT * FROM tournament",
       "SELECT * FROM tournament_entry",
+      "SELECT * FROM tournament_match",
       "SELECT * FROM open_lobbies",
       "SELECT * FROM open_lobby_members",
       "SELECT * FROM my_rack",
