@@ -12,6 +12,7 @@ import { Identity } from "spacetimedb";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import {
+  BAG,
   emptyRack,
   letterIndex,
   loadDict,
@@ -174,7 +175,29 @@ function subscribeMatch(matchId: bigint) {
       `SELECT * FROM match_participant WHERE match_id = ${id}`,
       `SELECT * FROM auction WHERE match_id = ${id}`,
       `SELECT * FROM auction_result WHERE match_id = ${id}`,
+      `SELECT * FROM word_play WHERE match_id = ${id}`,
     ]);
+}
+
+// Tiles we have not seen this match: the full bag minus every letter put up
+// for auction (including the open one) minus our own starting tiles. These
+// are still in the bag or in opponents' face-down starting racks. Built only
+// from public events and our own rack, so it survives restarts.
+function matchContext(matchId: bigint): { unseen: Uint8Array; bagLeft: number } {
+  const start = emptyRack();
+  for (const h of conn.db.myRack.iter()) if (h.matchId === matchId) start[letterIndex(h.letter)] += h.count;
+  for (const w of conn.db.wordPlay.iter())
+    if (w.matchId === matchId && w.botId === myBotId) for (const ch of w.word) start[letterIndex(ch)]++;
+  for (const r of conn.db.auctionResult.iter())
+    if (r.matchId === matchId && r.winnerBotId === myBotId) start[letterIndex(r.letter)]--;
+  const unseen = Uint8Array.from(BAG);
+  for (const a of conn.db.auction.iter()) if (a.matchId === matchId) unseen[letterIndex(a.letter)]--;
+  for (let i = 0; i < 26; i++) {
+    const v = (unseen[i] as number) - Math.max(0, start[i]);
+    unseen[i] = Math.max(0, v);
+  }
+  const m = conn.db.matchState.id.find(matchId);
+  return { unseen, bagLeft: m ? m.bagTotal : 0 };
 }
 
 function onAuction(a: { id: bigint; matchId: bigint; letter: string; status: { tag: string } }) {
@@ -186,6 +209,7 @@ function onAuction(a: { id: bigint; matchId: bigint; letter: string; status: { t
   const rack = rackFor(a.matchId);
   const left = auctionsLeft(a.matchId);
   const t = Date.now();
+  const ctx = matchContext(a.matchId);
   const amount = decideBid(
     DICT,
     {
@@ -194,6 +218,7 @@ function onAuction(a: { id: bigint; matchId: bigint; letter: string; status: { t
       balance: Number(p.balance),
       auctionsLeft: left,
       firstPrice: m?.auctionType.tag === "FirstPrice",
+      ...ctx,
       opponents: opponents(a.matchId),
     },
     PARAMS,
@@ -207,6 +232,8 @@ function onAuction(a: { id: bigint; matchId: bigint; letter: string; status: { t
     balance: Number(p.balance),
     left,
     rack: rackToString(rack),
+    unseen: ctx.unseen.reduce((x, y) => x + y, 0),
+    bagLeft: ctx.bagLeft,
     ms: Date.now() - t,
   });
   if (amount > 0) conn.reducers.submitBid({ auctionId: a.id, amount: BigInt(amount) }).catch(fail(`bid ${a.id}`));
@@ -222,7 +249,11 @@ function tryPlay(matchId: bigint) {
   const rack = rackFor(matchId);
   if (rackSize(rack) < 2) return;
   const t = Date.now();
-  const words = chooseWords(DICT, { rack, balance: Number(p.balance), auctionsLeft: auctionsLeft(matchId) }, PARAMS);
+  const words = chooseWords(
+    DICT,
+    { rack, balance: Number(p.balance), auctionsLeft: auctionsLeft(matchId), ...matchContext(matchId) },
+    PARAMS,
+  );
   if (words.length === 0) return;
   const pend = pendingWords.get(matchId) ?? [];
   pendingWords.set(matchId, pend);
