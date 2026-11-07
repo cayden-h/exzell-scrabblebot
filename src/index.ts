@@ -41,7 +41,17 @@ const ROOT = path.resolve(path.dirname(new URL(import.meta.url).pathname), "..")
 const TOKEN_PATH = path.join(ROOT, `.token-${BOT_NAME}`);
 const LOG_DIR = path.join(ROOT, "logs");
 
-const PARAMS: Params = { ...DEFAULT_PARAMS, ...loadParamOverrides() };
+// params.json may hold plain overrides, or {"variants": [{...}, {...}]} to
+// alternate parameter sets by match id (an A/B test against the same field).
+const OVERRIDES = loadParamOverrides() as Partial<Params> & { variants?: Partial<Params>[] };
+const { variants: VARIANTS, ...BASE_OVERRIDES } = OVERRIDES;
+const PARAMS: Params = { ...DEFAULT_PARAMS, ...BASE_OVERRIDES };
+function variantOf(matchId: bigint): number {
+  return VARIANTS && VARIANTS.length > 0 ? Number(matchId % BigInt(VARIANTS.length)) : 0;
+}
+function paramsFor(matchId: bigint): Params {
+  return VARIANTS && VARIANTS.length > 0 ? { ...PARAMS, ...VARIANTS[variantOf(matchId)] } : PARAMS;
+}
 
 function loadParamOverrides(): Partial<Params> {
   const p = path.join(ROOT, "params.json");
@@ -238,7 +248,7 @@ function onAuction(a: { id: bigint; matchId: bigint; letter: string; status: { t
       ...ctx,
       opponents: opponents(a.matchId),
     },
-    PARAMS,
+    paramsFor(a.matchId),
   );
   // Coins are worthless once the second-to-last auction closes, so spend them
   // all on it: we may still play the tile in the last window, and a rival can't.
@@ -267,12 +277,13 @@ function onAuction(a: { id: bigint; matchId: bigint; letter: string; status: { t
 function effectiveLeft(matchId: bigint): number {
   const left = auctionsLeft(matchId);
   const m = conn.db.matchState.id.find(matchId);
-  if (!m || left <= PARAMS.flushAt) return left;
+  const flushAt = paramsFor(matchId).flushAt;
+  if (!m || left <= flushAt) return left;
   const dur = Number(m.auctionDurationMs);
   const msLeft = (left - 1) * dur + dur / 2;
   if (msLeft < 2 * rttP90() + 300) {
     log("early_flush", { matchId, left, p90: rttP90() });
-    return PARAMS.flushAt;
+    return flushAt;
   }
   return left;
 }
@@ -288,7 +299,7 @@ function tryPlay(matchId: bigint) {
   const words = chooseWords(
     DICT,
     { rack, balance: Number(p.balance), auctionsLeft: effectiveLeft(matchId), ...matchContext(matchId) },
-    PARAMS,
+    paramsFor(matchId),
   );
   if (words.length === 0) return;
   const pend = pendingWords.get(matchId) ?? [];
@@ -353,7 +364,7 @@ function onConnect(c: DbConnection, identity: Identity, token: string) {
         process.exit(2);
       }
       myBotId = cred.botId;
-      log("acting_as", { botId: myBotId, name: c.db.bot.id.find(myBotId)?.name, params: PARAMS });
+      log("acting_as", { botId: myBotId, name: c.db.bot.id.find(myBotId)?.name, params: PARAMS, variants: VARIANTS ?? null });
       c.subscriptionBuilder()
         .onApplied(() => {
           // After a restart we may be mid-match: watch our most recent match.
@@ -405,6 +416,7 @@ function onConnect(c: DbConnection, identity: Identity, token: string) {
       const ours = me(neu.id);
       log("match_end", {
         matchId: neu.id,
+        variant: variantOf(neu.id),
         place,
         score: ours?.score,
         balance: ours?.balance,
