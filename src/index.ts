@@ -185,12 +185,45 @@ function me(matchId: bigint) {
 }
 
 function opponents(matchId: bigint): Opponent[] {
+  const won = new Map<bigint, Uint8Array>();
+  const played = new Map<bigint, Uint8Array>();
+  const get = (m: Map<bigint, Uint8Array>, id: bigint) => {
+    let r = m.get(id);
+    if (!r) m.set(id, (r = emptyRack()));
+    return r;
+  };
+  for (const r of conn.db.auctionResult.iter())
+    if (r.matchId === matchId && r.winnerBotId !== undefined && r.winnerBotId !== null)
+      get(won, r.winnerBotId)[letterIndex(r.letter)]++;
+  for (const w of conn.db.wordPlay.iter())
+    if (w.matchId === matchId) for (const ch of w.word) get(played, w.botId)[letterIndex(ch)]++;
+  const m = conn.db.matchState.id.find(matchId);
+  const startSize = m ? m.startingRackSize : 5;
   const out: Opponent[] = [];
   for (const p of conn.db.matchParticipant.iter()) {
     if (p.matchId !== matchId || p.botId === myBotId) continue;
     const bot = conn.db.bot.id.find(p.botId);
     const sim = bot?.isSimulated && bot.strategy.tag !== "Human" ? (bot.strategy.tag as SimKind) : null;
-    out.push({ botId: p.botId, balance: Number(p.balance), score: Number(p.score), sim });
+    // Known rack from public events: tiles won minus letters played. Letters
+    // played beyond what was won came from the hidden starting tiles.
+    const w = won.get(p.botId) ?? emptyRack();
+    const pl = played.get(p.botId) ?? emptyRack();
+    const knownRack = emptyRack();
+    let revealed = 0;
+    for (let i = 0; i < 26; i++) {
+      const d = w[i] - pl[i];
+      if (d >= 0) knownRack[i] = d;
+      else revealed -= d;
+    }
+    const o = {
+      botId: p.botId,
+      balance: Number(p.balance),
+      score: Number(p.score),
+      sim,
+      knownRack,
+      hidden: Math.max(0, startSize - revealed),
+    };
+    out.push(o);
   }
   return out;
 }
