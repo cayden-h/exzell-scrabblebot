@@ -4,7 +4,7 @@
 // word_play, match_participant, match_state, bot; ended matches only).
 // Output: bot/data/clones.json and a validation summary on stdout.
 //
-// npx tsx src/clonefit.ts [--holdout 0.25]
+// npx tsx src/clonefit.ts [--holdout 0.25] [--zero] [--tight] [--dump]
 
 import * as fs from "node:fs";
 import * as path from "node:path";
@@ -313,7 +313,6 @@ function evaluate(model: CloneModel, rows: Row[], baseline: number[]) {
   const predW = new Array(26).fill(0),
     actW = new Array(26).fill(0),
     cnt = new Array(26).fill(0);
-  let ll = 0;
   for (const r of rows) {
     const F = rowFeat(r);
     const { mu, q } = muQ(model, F, r.L);
@@ -332,7 +331,6 @@ function evaluate(model: CloneModel, rows: Row[], baseline: number[]) {
     const pw = thr > r.bal ? 0 : (1 - q) * (1 - Phi((Math.log(thr) - mu) / model.sigma));
     predW[r.L] += pw;
     cnt[r.L]++;
-    if (r.kind !== "unsold") ll += 0;
   }
   return { mae: mae / n, maeB: maeB / n, maeC: maeC / n, n, predW, actW, cnt };
 }
@@ -447,8 +445,6 @@ function main() {
     console.log(
       `held-out MAE winning bid: model conditional on winning ${ev.maeC.toFixed(2)}, unconditional ${ev.mae.toFixed(2)} vs per-letter median ${ev.maeB.toFixed(2)} (n=${ev.n}); in-sample model ${evIn.mae.toFixed(2)}`,
     );
-    const bb = (ev2: typeof ev) => ev2;
-    void bb;
     {
       const byB = BUCKETS.map(() => [0, 0]);
       for (const r of train) {
