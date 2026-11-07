@@ -46,8 +46,29 @@ const LOG_DIR = path.join(ROOT, "logs");
 const OVERRIDES = loadParamOverrides() as Partial<Params> & { variants?: Partial<Params>[] };
 const { variants: VARIANTS, ...BASE_OVERRIDES } = OVERRIDES;
 const PARAMS: Params = { ...DEFAULT_PARAMS, ...BASE_OVERRIDES };
+// Each match gets the variant with the fewest matches so far (counted from
+// this log, so the split stays balanced across restarts), fixed at first use.
+const variantByMatch = new Map<bigint, number>();
+const variantCounts: number[] = (VARIANTS ?? []).map(() => 0);
+try {
+  const logPath = path.join(LOG_DIR, `bot-${new Date().toISOString().slice(0, 10)}.jsonl`);
+  for (const line of fs.readFileSync(logPath, "utf8").split("\n")) {
+    if (!line.includes('"match_end"') || !line.includes('"variant"')) continue;
+    const v = JSON.parse(line).variant;
+    if (typeof v === "number" && v < variantCounts.length) variantCounts[v]++;
+  }
+} catch {
+  // no log yet
+}
 function variantOf(matchId: bigint): number {
-  return VARIANTS && VARIANTS.length > 0 ? Number(matchId % BigInt(VARIANTS.length)) : 0;
+  if (!VARIANTS || VARIANTS.length === 0) return 0;
+  let v = variantByMatch.get(matchId);
+  if (v === undefined) {
+    v = variantCounts.indexOf(Math.min(...variantCounts));
+    variantByMatch.set(matchId, v);
+    variantCounts[v]++;
+  }
+  return v;
 }
 function paramsFor(matchId: bigint): Params {
   return VARIANTS && VARIANTS.length > 0 ? { ...PARAMS, ...VARIANTS[variantOf(matchId)] } : PARAMS;
