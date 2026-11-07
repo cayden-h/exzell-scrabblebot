@@ -43,8 +43,8 @@ const LOG_DIR = path.join(ROOT, "logs");
 
 // params.json may hold plain overrides, or {"variants": [{...}, {...}]} to
 // alternate parameter sets by match id (an A/B test against the same field).
-const OVERRIDES = loadParamOverrides() as Partial<Params> & { variants?: Partial<Params>[] };
-const { variants: VARIANTS, ...BASE_OVERRIDES } = OVERRIDES;
+const OVERRIDES = loadParamOverrides() as Partial<Params> & { variants?: Partial<Params>[]; abTag?: string };
+const { variants: VARIANTS, abTag: AB_TAG = "", ...BASE_OVERRIDES } = OVERRIDES;
 const PARAMS: Params = { ...DEFAULT_PARAMS, ...BASE_OVERRIDES };
 // Each match gets the variant with the fewest matches so far (counted from
 // this log, so the split stays balanced across restarts), fixed at first use.
@@ -54,8 +54,9 @@ try {
   const logPath = path.join(LOG_DIR, `bot-${new Date().toISOString().slice(0, 10)}.jsonl`);
   for (const line of fs.readFileSync(logPath, "utf8").split("\n")) {
     if (!line.includes('"match_end"') || !line.includes('"variant"')) continue;
-    const v = JSON.parse(line).variant;
-    if (typeof v === "number" && v < variantCounts.length) variantCounts[v]++;
+    const row = JSON.parse(line);
+    if ((row.ab ?? "") !== AB_TAG) continue;
+    if (typeof row.variant === "number" && row.variant < variantCounts.length) variantCounts[row.variant]++;
   }
 } catch {
   // no log yet
@@ -471,6 +472,7 @@ function onConnect(c: DbConnection, identity: Identity, token: string) {
       log("match_end", {
         matchId: neu.id,
         variant: variantOf(neu.id),
+        ab: AB_TAG,
         place,
         score: ours?.score,
         balance: ours?.balance,
