@@ -7,6 +7,7 @@
 //   [--sweep key=v1,v2,...]     field/sims mode: run one batch per value
 //   [--lambdas 1.5,2,...]       mirror mode lambdas (6 values)
 
+import * as fs from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import {
@@ -27,6 +28,7 @@ import {
   DEFAULT_PARAMS,
   chooseWords,
   decideBid,
+  letterValue,
   type Opponent,
   type Params,
   type SimKind,
@@ -95,10 +97,73 @@ function simBestPlayable(D: Dict, r: Rack): number {
 type Kind =
   | { t: "ours"; p: Params; label: string }
   | { t: "sim"; s: SimKind; label: string }
-  | { t: "lucent"; prices: number[]; label: string };
+  | { t: "lucent"; prices: number[]; label: string }
+  | { t: "rival"; r: Rival; label: string };
+
+// ---------- Rival models from data/rivals.json (mode real) ----------
+// Per letter, the archived top bid on auctions the rival won (biased upward,
+// so scaled by RSCALE), sampled uniformly between p25 and p75, times a phase
+// factor from bidPerFaceByPhase, capped by balance.
+interface Rival {
+  name: string;
+  weight: number;
+  lo: number[];
+  hi: number[];
+  phase: [number, number, number]; // early, mid, late
+  minLen: number;
+}
+let RIVALS: Rival[] = [];
+let RSCALE = 1.0;
+function loadRivals(file: string) {
+  const d = JSON.parse(fs.readFileSync(file, "utf8"));
+  const field = d._field.byLetter;
+  const out: Rival[] = [];
+  for (const [name, v] of Object.entries<any>(d)) {
+    if (name.startsWith("_") || name === "exzell" || (v.matches ?? 0) < 20) continue;
+    const lo: number[] = [];
+    const hi: number[] = [];
+    for (let i = 0; i < 26; i++) {
+      const L = String.fromCharCode(65 + i);
+      const b = v.byLetter?.[L];
+      const f = field[L]?.winningBid ?? { p25: 5, p75: 10 };
+      const use = b && b.n >= 5 ? b : f;
+      lo.push(use.p25);
+      hi.push(use.p75);
+    }
+    const ph = v.bidPerFaceByPhase;
+    const tot = (ph.early.p50 * ph.early.n + ph.mid.p50 * ph.mid.n + ph.late.p50 * ph.late.n) / (ph.early.n + ph.mid.n + ph.late.n);
+    out.push({
+      name,
+      weight: v.matches,
+      lo,
+      hi,
+      phase: [ph.early.p50 / tot, ph.mid.p50 / tot, ph.late.p50 / tot],
+      minLen: Math.max(5, Math.min(7, Math.round(v.medianWordLen ?? 7))),
+    });
+  }
+  out.sort((a, b) => b.weight - a.weight);
+  RIVALS = out;
+}
+// Rack awareness: scale by how much our own table rule (dup and vowel balance)
+// changes the letter's value on this rack. Off with --rackaware 0.
+let RACK_AWARE = 1;
+const EMPTY = new Uint8Array(26);
+function rivalBid(r: Rival, letter: number, left: number, balance: number, rng: RNG, rack: Rack): number {
+  if (left <= 1) return 0;
+  const ph = left > 45 ? r.phase[0] : left > 15 ? r.phase[1] : r.phase[2];
+  let fit = 1;
+  if (RACK_AWARE) {
+    const L = String.fromCharCode(65 + letter);
+    const base = L === "Q" ? 5.5 : letterValue(L, EMPTY, DEFAULT_PARAMS);
+    fit = Math.max(0.3, Math.min(1.3, letterValue(L, rack, DEFAULT_PARAMS) / base));
+  }
+  const raw = (r.lo[letter] + rng() * (r.hi[letter] - r.lo[letter])) * RSCALE * ph * fit;
+  return Math.max(0, Math.min(Math.round(raw), balance));
+}
 
 interface Seat {
   id: number;
+  unseen: Uint8Array; // our view: BAG - start rack - every letter auctioned so far
   kind: Kind;
   rack: Rack;
   balance: number;
@@ -137,21 +202,26 @@ function play(D: Dict, seat: Seat, word: string) {
 }
 
 // Word play opportunity before an auction opens. `left` includes that auction.
-function playPhase(D: Dict, seats: Seat[], left: number) {
+function playPhase(D: Dict, seats: Seat[], left: number, bagLeft: number) {
   for (const s of seats) {
     if (s.kind.t === "ours") {
       for (let it = 0; it < 12; it++) {
-        const ws = chooseWords(D, { rack: s.rack, balance: s.balance, auctionsLeft: left }, s.kind.p);
+        const ws = chooseWords(
+          D,
+          { rack: s.rack, balance: s.balance, auctionsLeft: left, unseen: s.unseen, bagLeft },
+          s.kind.p,
+        );
         if (ws.length === 0) break;
         for (const w of ws) play(D, s, w);
       }
-    } else if (s.kind.t === "lucent") {
+    } else if (s.kind.t === "lucent" || s.kind.t === "rival") {
+      const minLen = s.kind.t === "rival" ? s.kind.r.minLen : 7;
       if (left <= 2) {
         const part = bestPartition(D, s.rack, solveBudgetK(rackSize(s.rack)));
         for (const w of part.words) play(D, s, w);
       } else {
         for (let it = 0; it < 4; it++) {
-          const c = playable(D, s.rack, 7);
+          const c = playable(D, s.rack, minLen);
           if (c.length === 0) break;
           let best = c[0];
           for (const i of c) if (D.score[i] > D.score[best]) best = i;
@@ -175,15 +245,19 @@ function runMatch(D: Dict, kinds: Kind[], rng: RNG) {
     score: 0,
     won: 0,
     paid: 0,
+    unseen: Uint8Array.from(BAG),
   }));
   for (const s of seats) for (let k = 0; k < RACK0; k++) s.rack[bag[pos++]]++;
+  for (const s of seats) for (let i = 0; i < 26; i++) s.unseen[i] -= s.rack[i];
   const solveMs: number[] = seats.map(() => 0);
 
   for (let a = 0; a < AUCTIONS; a++) {
     const left = AUCTIONS - a;
     const letter = bag[pos++];
     const L = String.fromCharCode(65 + letter);
-    playPhase(D, seats, left);
+    for (const s of seats) s.unseen[letter]--;
+    const bagLeft = left - 1;
+    playPhase(D, seats, left, bagLeft);
 
     const bids: { seat: number; amt: number }[] = [];
     for (const s of seats) {
@@ -192,6 +266,8 @@ function runMatch(D: Dict, kinds: Kind[], rng: RNG) {
         amt = simBid(s.kind.s, letter, s.balance, randInt(rng, -2, 2));
       } else if (s.kind.t === "lucent") {
         amt = Math.min(s.kind.prices[letter], s.balance);
+      } else if (s.kind.t === "rival") {
+        amt = rivalBid(s.kind.r, letter, left, s.balance, rng, s.rack);
       } else {
         const opponents: Opponent[] = seats
           .filter((o) => o !== s)
@@ -204,10 +280,21 @@ function runMatch(D: Dict, kinds: Kind[], rng: RNG) {
         const t0 = performance.now();
         amt = decideBid(
           D,
-          { letter: L, rack: s.rack, balance: s.balance, auctionsLeft: left, firstPrice: false, opponents },
+          {
+            letter: L,
+            rack: s.rack,
+            balance: s.balance,
+            auctionsLeft: left,
+            firstPrice: false,
+            opponents,
+            unseen: s.unseen,
+            bagLeft,
+          },
           s.kind.p,
         );
-        solveMs[s.id] += performance.now() - t0;
+        const dt = performance.now() - t0;
+        solveMs[s.id] += dt;
+        BID_MS.push(dt);
         amt = Math.max(0, Math.min(Math.floor(amt), s.balance)); // submit rejects > balance
       }
       if (amt > 0) bids.push({ seat: s.id, amt });
@@ -234,6 +321,7 @@ function runMatch(D: Dict, kinds: Kind[], rng: RNG) {
 }
 
 // ---------- Stats ----------
+const BID_MS: number[] = [];
 interface Agg {
   n: number;
   score: number;
@@ -296,23 +384,38 @@ function parseArgs() {
     p: get("p"),
     sweep: get("sweep"),
     lambdas: get("lambdas"),
+    q: get("q"),
+    json: a.includes("--json"),
+    rscale: get("rscale"),
+    rackaware: get("rackaware"),
   };
 }
 
 function withOverrides(base: Params, spec?: string): Params {
-  const p: Params = { ...base, dup: [...base.dup] };
+  const p: Params = { ...base, dup: [...base.dup], floors: { ...base.floors }, caps: { ...base.caps } };
   if (!spec) return p;
   for (const kv of spec.split(",")) {
     const [k, v] = kv.split("=");
     if (!(k in p)) throw new Error(`unknown param ${k}`);
-    (p as any)[k] = Number(v);
+    const cur = (p as any)[k];
+    if (typeof cur === "string") (p as any)[k] = v;
+    else if (Array.isArray(cur)) (p as any)[k] = v.split("/").map(Number);
+    else if (typeof cur === "object") {
+      // floors=A:10/E:10 merges into the record
+      const o = { ...cur };
+      for (const e of v.split("/")) {
+        const [l, n] = e.split(":");
+        o[l] = Number(n);
+      }
+      (p as any)[k] = o;
+    } else (p as any)[k] = Number(v);
   }
   return p;
 }
 
 const SIM_POOL: SimKind[] = ["Cheapskate", "ValueBidder", "Aggressive", "ValueBidder", "Aggressive", "Cheapskate"];
 
-function lineup(mode: string, ours: Params, rng: RNG, lambdas: number[]): Kind[] {
+function lineup(mode: string, ours: Params, rng: RNG, lambdas: number[], alt: Params): Kind[] {
   const sims = (n: number): Kind[] => {
     const pool = [...SIM_POOL];
     shuffle(rng, pool);
@@ -335,12 +438,41 @@ function lineup(mode: string, ours: Params, rng: RNG, lambdas: number[]): Kind[]
       ourKind(ours, "ours"),
       ...Array.from({ length: 5 }, (): Kind => ({ t: "lucent", prices: lucentPrices(rng), label: "lucent-like" })),
     ];
+  else if (mode === "real" || mode === "realduel") {
+    // LUCENT always, plus other rivals drawn by match count without replacement.
+    const pool = [...RIVALS];
+    const pick: Rival[] = [];
+    const lu = pool.findIndex((r) => r.name === "LUCENT");
+    if (lu >= 0) pick.push(...pool.splice(lu, 1));
+    const need = mode === "real" ? 5 : 4;
+    while (pick.length < need && pool.length) {
+      const tot = pool.reduce((a, r) => a + r.weight, 0);
+      let x = rng() * tot;
+      let i = 0;
+      while (i < pool.length - 1 && (x -= pool[i].weight) > 0) i++;
+      pick.push(...pool.splice(i, 1));
+    }
+    const rv = pick.map((r): Kind => ({ t: "rival", r, label: r.name === "LUCENT" ? "LUCENT" : "rival:other" }));
+    ks = mode === "real" ? [ourKind(ours, "ours"), ...rv] : [ourKind(ours, "A"), ourKind(alt, "B"), ...rv];
+  } else if (mode === "vs")
+    // 3 seats of A (--p) against 3 seats of B (--p then --q), nothing else.
+    ks = [
+      ...Array.from({ length: 3 }, () => ourKind(ours, "A")),
+      ...Array.from({ length: 3 }, () => ourKind(alt, "B")),
+    ];
+  else if (mode === "duel")
+    // One A and one B in a field of 4 lucent-like.
+    ks = [
+      ourKind(ours, "A"),
+      ourKind(alt, "B"),
+      ...Array.from({ length: 4 }, (): Kind => ({ t: "lucent", prices: lucentPrices(rng), label: "lucent-like" })),
+    ];
   else throw new Error(`unknown mode ${mode}`);
   shuffle(rng, ks);
   return ks;
 }
 
-function batch(D: Dict, mode: string, matches: number, seed: number, ours: Params, lambdas: number[]) {
+function batch(D: Dict, mode: string, matches: number, seed: number, ours: Params, lambdas: number[], alt: Params) {
   const aggs = new Map<string, Agg>();
   const t0 = performance.now();
   let maxMs = 0;
@@ -348,7 +480,7 @@ function batch(D: Dict, mode: string, matches: number, seed: number, ours: Param
     // Fresh stream per match so sweeps compare on the same bags.
     const rng = mulberry32(seed * 100003 + m * 7919 + 1);
     const t1 = performance.now();
-    const { seats } = runMatch(D, lineup(mode, ours, rng, lambdas), rng);
+    const { seats } = runMatch(D, lineup(mode, ours, rng, lambdas, alt), rng);
     maxMs = Math.max(maxMs, performance.now() - t1);
     record(aggs, seats);
   }
@@ -362,6 +494,9 @@ function main() {
   const tl = performance.now();
   const D = loadDict(path.join(here, "..", "data", "wordlist.txt"));
   buildSimOrder(D);
+  if (args.rscale) RSCALE = Number(args.rscale);
+  if (args.rackaware) RACK_AWARE = Number(args.rackaware);
+  if (args.mode.startsWith("real")) loadRivals(path.join(here, "..", "data", "rivals.json"));
   console.log(`dict ${D.N} classes loaded in ${(performance.now() - tl).toFixed(0)} ms`);
   const base = withOverrides(DEFAULT_PARAMS, args.p);
   const lambdas = args.lambdas ? args.lambdas.split(",").map(Number) : [1.5, 2.0, 2.3, 2.6, 3.0, 3.5];
@@ -373,11 +508,19 @@ function main() {
   } else runs.push({ title: args.p ?? "DEFAULT_PARAMS", p: base });
 
   for (const r of runs) {
-    const { aggs, ms, maxMs } = batch(D, args.mode, args.matches, args.seed, r.p, lambdas);
+    BID_MS.length = 0;
+    const alt = withOverrides(r.p, args.q);
+    const { aggs, ms, maxMs } = batch(D, args.mode, args.matches, args.seed, r.p, lambdas, alt);
+    const sorted = [...BID_MS].sort((a, b) => a - b);
+    const pct = (q: number) => (sorted.length ? sorted[Math.min(sorted.length - 1, Math.floor(q * sorted.length))] : 0);
     console.log(
-      `\n## mode=${args.mode} ${r.title} matches=${args.matches} seed=${args.seed}  (${(ms / args.matches).toFixed(1)} ms/match, max ${maxMs.toFixed(0)} ms, ${((1000 * args.matches) / ms).toFixed(1)} matches/s)\n`,
+      `\n## mode=${args.mode}${args.mode.startsWith("real") ? ` rscale=${RSCALE} rackaware=${RACK_AWARE}` : ""} ${r.title} matches=${args.matches} seed=${args.seed}  (${(ms / args.matches).toFixed(1)} ms/match, max ${maxMs.toFixed(0)} ms, ${((1000 * args.matches) / ms).toFixed(1)} matches/s)\n`,
     );
     console.log(report(aggs, args.matches));
+    console.log(
+      `\ndecideBid ms: p50 ${pct(0.5).toFixed(2)} p90 ${pct(0.9).toFixed(2)} p99 ${pct(0.99).toFixed(2)} max ${pct(1).toFixed(2)} (n=${sorted.length})`,
+    );
+    if (args.json) console.log("JSON " + JSON.stringify({ title: r.title, mode: args.mode, seed: args.seed, matches: args.matches, aggs: Object.fromEntries(aggs) }));
   }
 }
 

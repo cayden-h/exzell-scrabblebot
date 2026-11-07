@@ -5,12 +5,14 @@
 import {
   VAL,
   bestPartition,
+  playable,
   rackSize,
   solveBudgetK,
   wordReward,
   type Dict,
   type Rack,
 } from "./engine.js";
+import { mcBestCash, mcLetterValue, type McOpts } from "./valuation.js";
 
 export interface Params {
   lambda: number; // bid multiplier on point value (Vickrey)
@@ -27,16 +29,42 @@ export interface Params {
   rackCap: number; // above this rack size, cash the best 7+ word
   flushAt: number; // auctions left (incl. current) when we play everything
   simMargin: number; // bid this much above the highest sim cap
+  // Letter valuation: "table" = fixed T table with rack adjustments,
+  // "mc" = bag-aware Monte Carlo (valuation.ts); falls back to table when
+  // the state has no `unseen` pool.
+  valueMode: "table" | "mc";
+  mcSamples: number; // future draws per bid
+  mcShare: number; // share of the remaining bag we expect to win
+  mcFmax: number; // cap on future tiles per draw
+  mcK: number; // partition breadth cap for large racks
+  mcScale: number; // multiplier on the MC value (keeps lambda comparable)
+  mcBlend: number; // 1 = pure MC, 0 = pure table
+  cashMode: "table" | "mc"; // which 7+ word to cash: highest reward, or least expected loss
+  // Cash a cashMinLen+ word from the best partition whenever auctionsLeft is
+  // at or below this, regardless of balance (68 = always; 0 = off).
+  cashAlwaysLeft: number;
+  // Per-letter bid floor (outside the endgame), applied only while we hold
+  // fewer than floorMaxCopies of the letter. floorOn 0 disables.
+  floorOn: number;
+  floors: Record<string, number>;
+  floorMaxCopies: number;
+  // Per-letter bid cap. capOn 0 disables. Q's cap applies only with a U held;
+  // without a U, Q stays at its table value.
+  capOn: number;
+  caps: Record<string, number>;
+  // Bid multipliers by phase: early = auctionsLeft > 45, late = auctionsLeft <= 15.
+  phaseEarly: number;
+  phaseLate: number;
 }
 
 export const DEFAULT_PARAMS: Params = {
   lambda: 2.8,
   lambdaFirstPrice: 1.6,
-  dup: [1, 0.6, 0.3, 0.1, 0.05],
+  dup: [1, 0.8, 0.5, 0.25, 0.1],
   vowHi: 0.5,
   vowLo: 0.25,
-  vowPen: 0.5,
-  consPen: 0.6,
+  vowPen: 0.7,
+  consPen: 0.75,
   endgame: 3,
   endgameLambda: 4,
   cashFloor: 20,
@@ -44,7 +72,31 @@ export const DEFAULT_PARAMS: Params = {
   rackCap: 16,
   flushAt: 2,
   simMargin: 1,
+  valueMode: "table",
+  mcSamples: 8,
+  mcShare: 0.25,
+  mcFmax: 6,
+  mcK: 24,
+  mcScale: 1,
+  mcBlend: 1,
+  cashMode: "table",
+  cashAlwaysLeft: 0,
+  floorOn: 1,
+  floors: { A: 10, E: 10, I: 10, O: 10, L: 10, N: 10, R: 10, T: 10, U: 9, S: 12, D: 12, G: 12 },
+  floorMaxCopies: 2,
+  capOn: 0,
+  caps: { M: 17, B: 17, P: 17, V: 17, C: 18, W: 18, F: 19, Y: 19, H: 20, K: 22, J: 26, X: 28, Z: 30, Q: 18 },
+  phaseEarly: 0.9,
+  phaseLate: 1.2,
 };
+
+function mcOpts(p: Params, bagLeft: number): McOpts {
+  return {
+    samples: p.mcSamples,
+    future: Math.max(0, Math.min(p.mcFmax, Math.round(p.mcShare * bagLeft))),
+    K: p.mcK,
+  };
+}
 
 // Marginal point value of one more tile on a ~9-tile rack (research 02, Monte Carlo).
 const T: Record<string, number> = {
@@ -71,6 +123,11 @@ export interface BidState {
   auctionsLeft: number; // including this one
   firstPrice: boolean;
   opponents: Opponent[];
+  // Tiles not yet seen by us: full 98-tile bag minus every letter auctioned
+  // so far in this match (including the current one) minus our 5 starting
+  // tiles. They are in the bag or in opponents' face-down racks.
+  unseen?: Uint8Array;
+  bagLeft?: number; // tiles still in the bag after the current auction's letter
 }
 
 // Point value of the letter to us, from the table plus rack adjustments.
@@ -126,6 +183,11 @@ export function decideBid(D: Dict, s: BidState, p: Params = DEFAULT_PARAMS): num
   }
 
   v = letterValue(s.letter, s.rack, p);
+  if (p.valueMode === "mc" && s.unseen) {
+    const bagLeft = s.bagLeft ?? Math.max(0, s.auctionsLeft - 1);
+    const mc = p.mcScale * mcLetterValue(D, s.rack, IDX(s.letter), s.unseen, mcOpts(p, bagLeft));
+    v = p.mcBlend * mc + (1 - p.mcBlend) * v;
+  }
 
   const real = s.opponents.filter((o) => o.sim === null);
   if (real.length === 0 && s.opponents.length > 0) {
@@ -139,6 +201,18 @@ export function decideBid(D: Dict, s: BidState, p: Params = DEFAULT_PARAMS): num
   const rich = s.balance / Math.max(1, s.auctionsLeft);
   const pace = rich > 6 ? 1.3 : rich < 1.5 ? 0.8 : 1;
   let b = lambda * v * pace;
+  if (s.auctionsLeft > 45) b *= p.phaseEarly;
+  else if (s.auctionsLeft <= 15) b *= p.phaseLate;
+
+  const held = s.rack[IDX(s.letter)];
+  if (p.capOn) {
+    const cap = p.caps[s.letter];
+    if (cap !== undefined && (s.letter !== "Q" || s.rack[IDX("U")] > 0)) b = Math.min(b, cap);
+  }
+  if (p.floorOn && v > 0 && held < p.floorMaxCopies) {
+    const fl = p.floors[s.letter];
+    if (fl !== undefined) b = Math.max(b, fl);
+  }
 
   // Cap-snipe: a real rival with little cash cannot outbid balance + 1.
   const maxRivalCash = Math.max(0, ...real.map((o) => o.balance));
@@ -160,6 +234,8 @@ export interface PlayState {
   rack: Rack;
   balance: number;
   auctionsLeft: number; // including the open one; 0 if unknown
+  unseen?: Uint8Array; // same meaning as BidState.unseen
+  bagLeft?: number; // same meaning as BidState.bagLeft
 }
 
 // Words to submit now. Empty means hold.
@@ -172,7 +248,7 @@ export function chooseWords(D: Dict, s: PlayState, p: Params = DEFAULT_PARAMS): 
   // Endgame flush: play the whole best partition.
   if (s.auctionsLeft > 0 && s.auctionsLeft <= p.flushAt) return part.words;
 
-  const needCash = s.balance < p.cashFloor;
+  const needCash = s.balance < p.cashFloor || (s.auctionsLeft > 0 && s.auctionsLeft <= p.cashAlwaysLeft);
   const tooBig = size > p.rackCap;
   if (!needCash && !tooBig) return [];
 
@@ -180,7 +256,20 @@ export function chooseWords(D: Dict, s: PlayState, p: Params = DEFAULT_PARAMS): 
   const long = part.words
     .filter((w) => w.length >= p.cashMinLen)
     .sort((a, b) => wordReward(b) - wordReward(a));
-  if (long.length > 0) return [long[0]];
+  if (long.length > 0) {
+    if (p.cashMode === "mc" && s.unseen) {
+      // Any playable long word is a candidate, not only the one in the best
+      // partition; keep the one that loses the least expected future value.
+      const cands = playable(D, s.rack, p.cashMinLen)
+        .sort((a, b) => D.score[b] - D.score[a])
+        .slice(0, 12)
+        .map((i) => D.words[i]);
+      const bagLeft = s.bagLeft ?? Math.max(0, s.auctionsLeft - 1);
+      const pick = mcBestCash(D, s.rack, cands, s.unseen, mcOpts(p, bagLeft));
+      if (pick) return [pick.word];
+    }
+    return [long[0]];
+  }
   // Broke with no long word: cash the best word worth something.
   if (s.balance < 10 && s.auctionsLeft > 8) {
     const best = [...part.words].sort((a, b) => wordReward(b) - wordReward(a))[0];
