@@ -37,15 +37,17 @@ const DB_NAME = process.env.STDB_DB ?? "scrabblebot";
 const BOT_NAME = process.env.BOT_NAME ?? "exzell";
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const AUTO_REGISTER = process.env.AUTO_REGISTER !== "0";
-const PLAY_LOBBY = process.env.PLAY_LOBBY !== "0";
 const ROOT = path.resolve(path.dirname(new URL(import.meta.url).pathname), "..");
 const TOKEN_PATH = path.join(ROOT, `.token-${BOT_NAME}`);
 const LOG_DIR = path.join(ROOT, "logs");
 
 // params.json may hold plain overrides, or {"variants": [{...}, {...}]} to
 // alternate parameter sets by match id (an A/B test against the same field).
-const OVERRIDES = loadParamOverrides() as Partial<Params> & { variants?: Partial<Params>[]; abTag?: string };
-const { variants: VARIANTS, abTag: AB_TAG = "", ...BASE_OVERRIDES } = OVERRIDES;
+const OVERRIDES = loadParamOverrides() as Partial<Params> & { variants?: Partial<Params>[]; abTag?: string; playLobby?: boolean };
+const { variants: VARIANTS, abTag: AB_TAG = "", playLobby: PLAY_LOBBY_OVERRIDE, ...BASE_OVERRIDES } = OVERRIDES;
+// Casual lobby play: off with PLAY_LOBBY=0 or {"playLobby": false} in params.json
+// (used before a tournament so the bot is free when it starts).
+const PLAY_LOBBY = process.env.PLAY_LOBBY !== "0" && PLAY_LOBBY_OVERRIDE !== false;
 const PARAMS: Params = { ...DEFAULT_PARAMS, ...BASE_OVERRIDES };
 // Each match gets the variant with the fewest matches so far (counted from
 // this log, so the split stays balanced across restarts), fixed at first use.
@@ -433,7 +435,7 @@ function onConnect(c: DbConnection, identity: Identity, token: string) {
         process.exit(2);
       }
       myBotId = cred.botId;
-      log("acting_as", { botId: myBotId, name: c.db.bot.id.find(myBotId)?.name, params: PARAMS, variants: VARIANTS ?? null });
+      log("acting_as", { botId: myBotId, name: c.db.bot.id.find(myBotId)?.name, params: PARAMS, variants: VARIANTS ?? null, playLobby: PLAY_LOBBY });
       c.subscriptionBuilder()
         .onApplied(() => {
           // After a restart we may be mid-match: watch our most recent match.
