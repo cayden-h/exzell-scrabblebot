@@ -144,10 +144,15 @@ function timed<T>(p: Promise<T>): Promise<T> {
     if (rtts.length > 50) rtts.shift();
   });
 }
-function rttP90(): number {
+function rttQ(q: number): number {
   if (rtts.length < 5) return 300;
   const sorted = [...rtts].sort((a, b) => a - b);
-  return sorted[Math.floor(sorted.length * 0.9)];
+  return sorted[Math.floor((sorted.length - 1) * q)];
+}
+// Median, not p90: a few reducer promises resolve late in the SDK and made
+// p90 read ~6 s while the server answered in ~100 ms.
+function rttP90(): number {
+  return rttQ(0.5);
 }
 
 function fail(what: string) {
@@ -333,7 +338,9 @@ function effectiveLeft(matchId: bigint): number {
   const left = auctionsLeft(matchId);
   const m = conn.db.matchState.id.find(matchId);
   const flushAt = paramsFor(matchId).flushAt;
-  if (!m || left <= flushAt) return left;
+  // Flush at most 4 auctions early, so a bad latency reading can't cost the
+  // whole hoard.
+  if (!m || left <= flushAt || left > flushAt + 4) return left;
   const dur = Number(m.auctionDurationMs);
   const msLeft = (left - 1) * dur + dur / 2;
   if (msLeft < 2 * rttP90() + 300) {
@@ -472,6 +479,7 @@ function onConnect(c: DbConnection, identity: Identity, token: string) {
       log("match_end", {
         matchId: neu.id,
         variant: variantOf(neu.id),
+        rtt: { p50: rttQ(0.5), p90: rttQ(0.9), max: rttQ(1), n: rtts.length },
         ab: AB_TAG,
         place,
         score: ours?.score,
