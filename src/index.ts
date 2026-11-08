@@ -51,8 +51,11 @@ const PARAMS: Params = { ...DEFAULT_PARAMS, ...BASE_OVERRIDES };
 const variantByMatch = new Map<bigint, number>();
 const variantCounts: number[] = (VARIANTS ?? []).map(() => 0);
 try {
-  const logPath = path.join(LOG_DIR, `bot-${new Date().toISOString().slice(0, 10)}.jsonl`);
-  for (const line of fs.readFileSync(logPath, "utf8").split("\n")) {
+  const lines = fs
+    .readdirSync(LOG_DIR)
+    .filter((f) => f.endsWith(".jsonl"))
+    .flatMap((f) => fs.readFileSync(path.join(LOG_DIR, f), "utf8").split("\n"));
+  for (const line of lines) {
     if (!line.includes('"match_end"') || !line.includes('"variant"')) continue;
     const row = JSON.parse(line);
     if ((row.ab ?? "") !== AB_TAG) continue;
