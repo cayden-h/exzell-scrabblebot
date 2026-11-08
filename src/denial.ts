@@ -22,8 +22,8 @@ export interface DenialOpponent extends Opponent {
 
 export interface DenialState extends BidState {
   opponents: DenialOpponent[];
-  seats: number; // bots at the table, including us
-  myScore: number;
+  seats?: number; // bots at the table, including us (default: opponents + 1)
+  myScore?: number; // our score; without it the lead lock and the closeness test are off
 }
 
 export interface DenialParams {
@@ -34,6 +34,12 @@ export interface DenialParams {
   drainMinBal: number; // no drain floor when our balance is below this
   denyA: number; // weight on the rival's immediate gain; 0 = off
   denyStop: number; // no denial when auctionsLeft <= denyStop (endgame owns it)
+  denyStart: number; // denial only when auctionsLeft <= denyStart (0 = whole match)
+  denyMode: number; // 0 = raw immediate gain; 1 = gain in excess of the rival's mean gain over the unseen pool
+  denyCap: number; // cap on the denial term, in coins
+  denyAdd: number; // 1 = base + term; 0 = max(base, term)
+  denyMin: number; // ignore gains below this many points
+  denyRich: number; // deny only when our balance >= denyRich * the rival's balance (0 = always)
   hiddenVal: number; // points added to a rival's projection per hidden tile
   closeMargin: number; // 3-4 seats: deny only rivals within gain + this of us
   leadLockPpa: number; // lock when lead > leadLockPpa * auctionsLeft + leadLockPad
@@ -49,12 +55,18 @@ export const DEFAULT_DENIAL: DenialParams = {
   drain: 0.6,
   drainStop: 12,
   drainMinBal: 0,
-  denyA: 0.5,
+  denyA: 0, // measured: every denial form tested was neutral or harmful (14-denial.md)
   denyStop: 4,
+  denyStart: 0,
+  denyMode: 1,
+  denyCap: 40,
+  denyAdd: 1,
+  denyMin: 15,
+  denyRich: 1.2,
   hiddenVal: 3,
   closeMargin: 30,
-  leadLockPpa: 2,
-  leadLockPad: 20,
+  leadLockPpa: 0, // lead lock off: inert at ppa 2 / pad 20, -2 points at 0.5 / 5
+  leadLockPad: 1e9,
   leadLockHeadsUp: 0,
   fpOn: 0,
   fpDrain: 0,
@@ -85,6 +97,34 @@ export function cachedPartition(D: Dict, r: Rack): number {
   return v;
 }
 
+function letterGain(D: Dict, kr: Rack, L: number): number {
+  const w = Uint8Array.from(kr);
+  w[L]++;
+  return cachedPartition(D, w) - cachedPartition(D, kr);
+}
+
+// Expected gain of a random unseen tile to this rack: what the rival gets
+// from the auctions it would win instead. Weighted by the unseen pool (the
+// bag plus hidden racks); uniform over the bag counts when unknown.
+const MCACHE = new Map<string, number>();
+function meanGain(D: Dict, kr: Rack, unseen?: Uint8Array): number {
+  const pool = unseen ?? Uint8Array.from([9, 2, 2, 4, 12, 2, 3, 2, 9, 1, 1, 4, 2, 6, 8, 2, 1, 6, 4, 6, 4, 2, 2, 1, 2, 1]);
+  const k = key(kr) + key(pool);
+  let m = MCACHE.get(k);
+  if (m !== undefined) return m;
+  let tot = 0,
+    n = 0;
+  for (let i = 0; i < 26; i++) {
+    if (!pool[i]) continue;
+    tot += pool[i] * Math.max(0, letterGain(D, kr, i));
+    n += pool[i];
+  }
+  m = n ? tot / n : 0;
+  if (MCACHE.size > 50000) MCACHE.clear();
+  MCACHE.set(k, m);
+  return m;
+}
+
 export interface DenialInfo {
   bid: number;
   why: "off" | "lock" | "base" | "drain" | "deny";
@@ -93,20 +133,28 @@ export interface DenialInfo {
 
 export function denialDetail(D: Dict, s: DenialState, baseBid: number, p: DenialParams = DEFAULT_DENIAL): DenialInfo {
   const off = (why: DenialInfo["why"] = "off"): DenialInfo => ({ bid: baseBid, why, gain: 0 });
-  if (s.seats > p.maxSeats || s.seats < 2) return off();
+  const seats = s.seats ?? s.opponents.length + 1;
+  if (seats > p.maxSeats || seats < 2) return off();
   if (s.firstPrice && !p.fpOn) return off();
   if (s.auctionsLeft <= 1 || s.balance <= 0) return off();
   const rivals = s.opponents.filter((o) => o.sim === null);
   if (rivals.length === 0) return off();
 
   const L = s.letter.charCodeAt(0) - 65;
-  const myProj = s.myScore + cachedPartition(D, s.rack);
-  const proj = rivals.map((o) => o.score + (o.knownRack ? cachedPartition(D, o.knownRack) : 0) + p.hiddenVal * (o.hidden ?? 0));
+  const known = s.myScore !== undefined;
   const headsUp = rivals.length === 1;
+  const lockOn = known && p.leadLockPad < 1e8 && (!headsUp || p.leadLockHeadsUp);
+  const denyOn = p.denyA > 0 && s.auctionsLeft > p.denyStop && (p.denyStart <= 0 || s.auctionsLeft <= p.denyStart);
+  // Projections cost a partition solve per rack; only when something uses them.
+  const needProj = lockOn || (denyOn && known && !headsUp);
+  const myProj = needProj ? (s.myScore ?? 0) + cachedPartition(D, s.rack) : 0;
+  const proj = needProj
+    ? rivals.map((o) => o.score + (o.knownRack ? cachedPartition(D, o.knownRack) : 0) + p.hiddenVal * (o.hidden ?? 0))
+    : [];
 
   // Lead lock: the rival that matters is the one who would finish below us
   // (heads-up: the rival; elimination: the lowest rival).
-  if (!headsUp || p.leadLockHeadsUp) {
+  if (lockOn) {
     const lead = myProj - Math.min(...proj);
     if (lead > p.leadLockPpa * s.auctionsLeft + p.leadLockPad) return off("lock");
   }
@@ -123,20 +171,21 @@ export function denialDetail(D: Dict, s: DenialState, baseBid: number, p: Denial
   }
 
   let gain = 0;
-  if (p.denyA > 0 && s.auctionsLeft > p.denyStop) {
+  if (denyOn) {
     for (let i = 0; i < rivals.length; i++) {
       const kr = rivals[i].knownRack;
       if (!kr) continue;
-      const w = Uint8Array.from(kr);
-      w[L]++;
-      const g = cachedPartition(D, w) - cachedPartition(D, kr);
-      if (g <= 0) continue;
+      let g = letterGain(D, kr, L);
+      if (p.denyMode === 1) g -= meanGain(D, kr, s.unseen);
+      if (g <= 0 || g < p.denyMin) continue;
+      if (p.denyRich > 0 && s.balance < p.denyRich * rivals[i].balance) continue;
       // Elimination: only rivals that could swap places with us on this tile.
-      if (!headsUp && Math.abs(proj[i] - myProj) > g + p.closeMargin) continue;
+      if (known && !headsUp && Math.abs(proj[i] - myProj) > g + p.closeMargin) continue;
       if (g > gain) gain = g;
     }
     if (gain > 0) {
-      const d = baseBid + p.denyA * p.lambda * gain;
+      const term = Math.min(p.denyCap, p.denyA * p.lambda * gain);
+      const d = p.denyAdd ? baseBid + term : Math.max(baseBid, term);
       if (d > b) {
         b = d;
         why = "deny";
@@ -154,4 +203,17 @@ export function denialDetail(D: Dict, s: DenialState, baseBid: number, p: Denial
 
 export function denialBid(D: Dict, s: DenialState, baseBid: number, p: DenialParams = DEFAULT_DENIAL): number {
   return denialDetail(D, s, baseBid, p).bid;
+}
+
+// Word-play overrides by table size (docs/research/14-denial.md): at 2 to 4
+// seats, cashing at a lower balance floor keeps tiles together for bigger words.
+// cashFloor 0 is a cliff (never cash, go broke), so do not go below 7.
+export const SMALL_TABLE_PLAY: Record<number, Partial<import("./strategy.js").Params>> = {
+  2: { cashFloor: 7 },
+  3: { cashFloor: 7 },
+  4: { cashFloor: 7 },
+};
+export function smallTableParams<P extends object>(p: P, seats: number): P {
+  const o = SMALL_TABLE_PLAY[seats];
+  return o ? { ...p, ...o } : p;
 }

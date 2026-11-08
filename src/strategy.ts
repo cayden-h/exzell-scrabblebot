@@ -13,6 +13,7 @@ import {
   type Rack,
 } from "./engine.js";
 import { mcBestCash, mcLetterValue, type McOpts } from "./valuation.js";
+import { denialBid } from "./denial.js";
 
 export interface Params {
   lambda: number; // bid multiplier on point value (Vickrey)
@@ -194,7 +195,13 @@ export function partitionValue(D: Dict, rack: Rack): number {
   return bestPartition(D, rack, solveBudgetK(rackSize(rack))).total;
 }
 
-export function decideBid(D: Dict, s: BidState, p: Params = DEFAULT_PARAMS): number {
+// Small-table Vickrey drain floor (docs/research/14-denial.md). The wrapper is
+// off at 5+ seats, in first-price, and in the last 12 auctions.
+export function decideBid(D: Dict, s: BidState & { myScore?: number; seats?: number }, p: Params = DEFAULT_PARAMS): number {
+  return denialBid(D, s, decideBidBase(D, s, p));
+}
+
+export function decideBidBase(D: Dict, s: BidState, p: Params = DEFAULT_PARAMS): number {
   if (s.balance <= 0) return 0;
   // The last tile can never be played: the match ends as its auction closes.
   if (s.auctionsLeft <= 1) return 0;

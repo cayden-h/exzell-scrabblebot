@@ -8,6 +8,7 @@
 // simpler and safer than resyncing state in place.
 
 import { DbConnection, type ErrorContext } from "./module_bindings/index.js";
+import { smallTableParams } from "./denial.js";
 import { Identity } from "spacetimedb";
 import * as fs from "node:fs";
 import * as path from "node:path";
@@ -75,7 +76,10 @@ function variantOf(matchId: bigint): number {
   return v;
 }
 function paramsFor(matchId: bigint): Params {
-  return VARIANTS && VARIANTS.length > 0 ? { ...PARAMS, ...VARIANTS[variantOf(matchId)] } : PARAMS;
+  const base = VARIANTS && VARIANTS.length > 0 ? { ...PARAMS, ...VARIANTS[variantOf(matchId)] } : PARAMS;
+  let seats = 0;
+  for (const p of conn.db.matchParticipant.iter()) if (p.matchId === matchId) seats++;
+  return smallTableParams(base, seats); // cashFloor 7 at 2-4 seats (research 14); unchanged at 5+
 }
 
 function loadParamOverrides(): Partial<Params> {
